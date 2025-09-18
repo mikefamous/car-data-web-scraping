@@ -1,0 +1,239 @@
+---
+title: "Portfolio 2"
+output: html_document
+date: "2025-03-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Web Scraping with RSelenium and rvest
+
+### Load Required Libraries
+```{r libraries}
+library(tidyverse)
+library(RSelenium)
+library(rvest)
+library(netstat)
+library(data.table)
+library(httr)
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+library(tidyr)
+library(stringr)
+library(readr)
+```
+
+### Start Selenium Server and Open Browser
+```{r selenium}
+rD <- rsDriver(browser = "firefox", port = free_port(), verbose = FALSE, chromever = NULL)
+remDr <- rD$client
+```
+
+### Scrape Data from Motorpoint
+```{r scrape_motorpoint}
+url <- "https://www.motorpoint.co.uk/used-cars/suv"
+remDr$navigate(url)
+Sys.sleep(10)
+
+all_car_data <- list()
+
+scrape_page <- function() {
+  page_source <- remDr$getPageSource()[[1]]
+  page <- read_html(page_source)
+  
+  car_data <- page %>% 
+    html_nodes("div.vehicle-tile") %>% 
+    lapply(function(car) {
+      data.frame(
+        Car_Name = car %>% html_node("h3.title") %>% html_text(trim = TRUE),
+        Car_Description = car %>% html_node("p.sub-title") %>% html_text(trim = TRUE),
+        Primary_Details = car %>% html_node("p.primary-details") %>% html_text(trim = TRUE),
+        Secondary_Details = car %>% html_node("p.secondary-details") %>% html_text(trim = TRUE),
+        Price = car %>% html_node("span.price-text") %>% html_text(trim = TRUE),
+        Monthly_Price = car %>% html_node("span.monthly-price-text") %>% html_text(trim = TRUE),
+        stringsAsFactors = FALSE
+      )
+    }) %>% bind_rows()
+  
+  return(car_data)
+}
+
+for (page_num in 1:3) {
+  cat("Scraping page", page_num, "...\n")
+  all_car_data <- append(all_car_data, list(scrape_page()))
+  
+  next_button <- remDr$findElements("css selector", "a.next-btn-area[rel='next']")
+  if (length(next_button) > 0 && page_num < 3) {
+    next_button[[1]]$clickElement()
+    Sys.sleep(10)
+  } else {
+    break
+  }
+}
+
+all_car_data <- bind_rows(all_car_data)
+write.csv(all_car_data, "motorpoint_cars_3_pages.csv", row.names = FALSE)
+remDr$close()
+rD$server$stop()
+```
+
+### Scrape Data from Parkers
+```{r scrape_parkers}
+url <- "https://www.parkers.co.uk/cars-for-sale/search-results/"
+page <- read_html(url)
+
+car_data <- page %>% 
+  html_nodes("div.cfs-result-item") %>% 
+  lapply(function(car) {
+    data.frame(
+      Car_Name = car %>% html_node("span.cfs-result-item__title__text") %>% html_text(trim = TRUE),
+      Car_Description = car %>% html_node("a.cfs-result-item__detail-block__derivative") %>% html_text(trim = TRUE),
+      Car_Details = car %>% html_node("div.cfs-result-item__detail-block__details") %>% html_text(trim = TRUE),
+      Car_Price = car %>% html_node("div.cfs-result-item__price-block") %>% html_text(trim = TRUE),
+      stringsAsFactors = FALSE
+    )
+  }) %>% bind_rows()
+
+write.csv(car_data, "parkers_cars_rvest.csv", row.names = FALSE)
+```
+
+
+## Data Cleaning and Transformation
+```{r data_cleaning}
+#setwd("/Users/enomaenakhigbe/Downloads")
+
+# Load and clean Motorpoint dataset
+data <- read_csv("motorpoint_cars_3_pages.csv")
+
+data <- data %>% drop_na(Car_Name, Price)
+
+data <- data %>% mutate(
+  Year = str_extract(Primary_Details, "\\d{4}"),
+  Mileage = str_extract(Primary_Details, "[0-9,]+ miles") %>%
+    str_replace_all(",", "") %>%
+    str_replace(" miles", "") %>%
+    as.numeric(),
+  Fuel_Type = str_extract(Secondary_Details, "Diesel|Petrol|Hybrid|Electric"),
+  Warranty_Months = str_extract(Secondary_Details, "\\d+ months") %>%
+    str_replace(" months", "") %>%
+    as.numeric(),
+  Price = str_replace_all(Price, "£|,", "") %>% as.numeric(),
+  Monthly_Price = str_replace_all(Monthly_Price, "£|,", "") %>% as.numeric()
+) %>% select(-Primary_Details, -Secondary_Details)
+
+write_csv(data, "cleaned_motorpoint_cars.csv")
+
+# Load and clean Parkers dataset
+cars <- read.csv("parkers_cars_rvest.csv")
+
+cars <- cars %>% distinct() %>% na.omit()
+
+cars <- cars %>%
+  mutate(across(everything(), ~ str_trim(.))) %>%
+  mutate(Car_Price = str_replace_all(Car_Price, "[£,]", "")) %>%
+  mutate(Car_Price = as.numeric(Car_Price))
+
+cars <- cars %>%
+  separate(Car_Details, into = c("Transmission", "Year", "Fuel_Type", "Mileage"), sep = " \| ") %>%
+  mutate(Mileage = str_replace_all(Mileage, "[ miles,]", "")) %>%
+  mutate(Mileage = as.numeric(Mileage))
+
+write.csv(cars, "cleaned_parkers_cars.csv", row.names = FALSE)
+```
+
+## Combine Datasets
+```{r combine_data}
+motorpoint_cars <- read.csv("cleaned_motorpoint_cars.csv")
+parkers_cars <- read.csv("cleaned_parkers_cars.csv")
+
+parkers_cars <- parkers_cars %>% mutate(
+  Monthly_Price = NA,
+  Warranty_Months = NA,
+  Year = as.integer(sub("/.*", "", Year))
+) %>% rename(Price = Car_Price)
+
+motorpoint_cars <- motorpoint_cars %>% mutate(
+  Transmission = NA
+)
+
+combined_cars <- bind_rows(motorpoint_cars, parkers_cars)
+
+set.seed(123)
+combined_cars <- combined_cars %>% mutate(
+  Transmission = ifelse(
+    is.na(Transmission),
+    sample(c("Manual", "Automatic"), size = n(), replace = TRUE),
+    Transmission
+  )
+)
+
+combined_cars <- combined_cars %>% mutate(across(everything(), ~ replace(., is.na(.), 0)))
+
+write.csv(combined_cars, "combined_cars_with_transmission.csv", row.names = FALSE)
+```
+
+## Exploratory Data Analysis (EDA)
+```{r visualization, echo=FALS}
+data <- read_csv("combined_cars_with_transmission.csv")
+
+str(data)
+summary(data)
+head(data)
+sum(is.na(data))
+colSums(is.na(data))
+
+# Visualizations
+# Histogram of car prices
+ggplot(data, aes(x=Price)) +
+  geom_histogram(binwidth=2000, fill="blue", color="black", alpha=0.7) +
+  theme_minimal() +
+  labs(title="Histogram of Car Prices", x="Price (£)", y="Count")
+
+# Histogram for Mileage
+ggplot(data, aes(x=Mileage)) +
+  geom_histogram(binwidth=5000, fill="green", color="black", alpha=0.7) +
+  theme_minimal() +
+  labs(title="Histogram of Car Mileage", x="Mileage (miles)", y="Count")
+
+# Bar plot for Fuel Type
+ggplot(data, aes(x=Fuel_Type)) +
+  geom_bar(fill="orange", color="black") +
+  theme_minimal() +
+  labs(title="Distribution of Fuel Type", x="Fuel Type", y="Count")
+
+# Scatter plot for Price vs Mileage
+ggplot(data, aes(x=Mileage, y=Price)) +
+  geom_point(color="blue", alpha=0.6) +
+  theme_minimal() +
+  labs(title="Price vs Mileage", x="Mileage (miles)", y="Price (£)")
+
+# Boxplot of Price by Fuel Type
+ggplot(data, aes(x=Fuel_Type, y=Price)) +
+  geom_boxplot(fill="purple", color="black") +
+  theme_minimal() +
+  labs(title="Car Price by Fuel Type", x="Fuel Type", y="Price (£)")
+
+# Correlation matrix for numeric variables
+data_numeric <- data %>% select(Price, Monthly_Price, Year, Mileage, Warranty_Months)
+cor_matrix <- cor(data_numeric, use="complete.obs")
+corrplot(cor_matrix, method="color", type="upper", tl.cex=0.8, tl.col="black")
+
+# Outlier detection using IQR
+Q1 <- quantile(data$Price, 0.25, na.rm=TRUE)
+Q3 <- quantile(data$Price, 0.75, na.rm=TRUE)
+IQR <- Q3 - Q1
+lower_bound <- Q1 - 1.5 * IQR
+upper_bound <- Q3 + 1.5 * IQR
+outliers <- data %>% filter(Price < lower_bound | Price > upper_bound)
+print(outliers)
+
+# Log transformation for Price
+data$log_Price <- log1p(data$Price)
+ggplot(data, aes(x=log_Price)) +
+  geom_histogram(binwidth=0.2, fill="blue", color="black", alpha=0.7) +
+  theme_minimal() +
+  labs(title="Log-Transformed Price Distribution", x="Log(Price)", y="Count")
+```
